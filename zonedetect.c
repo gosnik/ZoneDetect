@@ -67,6 +67,8 @@ struct ZoneDetectOpaque {
 #elif defined(__APPLE__) || defined(__linux__) || defined(__unix__) || defined(_POSIX_VERSION)
     int fd;
     off_t length;
+#elif defined(ARDUINO_ARCH_ESP32)
+    int length;
 #else
     int length;
 #endif
@@ -85,6 +87,8 @@ struct ZoneDetectOpaque {
     uint32_t bboxOffset;
     uint32_t metadataOffset;
     uint32_t dataOffset;
+    ZDFnReadByte fnRead;
+    ZDFnLength fnLen;
 };
 
 static void (*zdErrorHandler)(int, int);
@@ -105,9 +109,35 @@ static float ZDFixedPointToFloat(int32_t input, float scale, unsigned int precis
     return value * scale;
 }
 
+static uint8_t ZDReadByteInternal(ZoneDetect *library, size_t ofs)
+{
+    switch (library->closeType)
+    {
+    case 0:
+    case 1:
+        return library->mapping[ofs];
+    
+    case 2:
+        return library->fnRead(ofs);
+    }
+}
+
+static size_t ZDGetLengthInternal(ZoneDetect *library)
+{
+    switch (library->closeType)
+    {
+    case 0:
+    case 1:
+        return library->length;
+    
+    case 2:
+        return library->fnLen();
+    }
+}
+
 static unsigned int ZDDecodeVariableLengthUnsigned(const ZoneDetect *library, uint32_t *index, uint64_t *result)
 {
-    if(*index >= (uint32_t)library->length) {
+    if(*index >= (uint32_t)ZDGetLengthInternal(library)) {
         return 0;
     }
 
@@ -116,20 +146,20 @@ static unsigned int ZDDecodeVariableLengthUnsigned(const ZoneDetect *library, ui
 #if defined(_MSC_VER)
     __try {
 #endif
-        uint8_t *const buffer = library->mapping + *index;
-        uint8_t *const bufferEnd = library->mapping + library->length - 1;
+        size_t offset = *index;
 
         unsigned int shift = 0;
         while(1) {
-            value |= ((((uint64_t)buffer[i]) & UINT8_C(0x7F)) << shift);
+            uint8_t b = ZDReadByteInternal(library, offset+i);
+            value |= ((((uint64_t)b) & UINT8_C(0x7F)) << shift);
             shift += 7u;
 
-            if(!(buffer[i] & UINT8_C(0x80))) {
+            if(!(b & UINT8_C(0x80))) {
                 break;
             }
 
             i++;
-            if(buffer + i > bufferEnd) {
+            if(offset+i > ZDGetLengthInternal(library)) {
                 return 0;
             }
         }
@@ -152,15 +182,15 @@ static unsigned int ZDDecodeVariableLengthUnsignedReverse(const ZoneDetect *libr
 {
     uint32_t i = *index;
 
-    if(*index >= (uint32_t)library->length) {
+    if(*index >= (uint32_t)ZDGetLengthInternal(library)) {
         return 0;
     }
 
 #if defined(_MSC_VER)
     __try {
 #endif
-
-        if(library->mapping[i] & UINT8_C(0x80)) {
+        uint8_t b = ZDReadByteInternal(library, i);
+        if(b & UINT8_C(0x80)) {
             return 0;
         }
 
@@ -169,7 +199,7 @@ static unsigned int ZDDecodeVariableLengthUnsignedReverse(const ZoneDetect *libr
         }
         i--;
 
-        while(library->mapping[i] & UINT8_C(0x80)) {
+        while(b & UINT8_C(0x80)) {
             if(!i) {
                 return 0;
             }
@@ -236,7 +266,8 @@ static char *ZDParseString(const ZoneDetect *library, uint32_t *index)
 #endif
             size_t i;
             for(i = 0; i < strLength; i++) {
-                str[i] = (char)(library->mapping[strOffset + i] ^ UINT8_C(0x80));
+                uint8_t b = ZDReadByteInternal(library, strOffset + i);
+                str[i] = (char)(b ^ UINT8_C(0x80));
             }
 #if defined(_MSC_VER)
         } __except(GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
@@ -258,21 +289,24 @@ static char *ZDParseString(const ZoneDetect *library, uint32_t *index)
 
 static int ZDParseHeader(ZoneDetect *library)
 {
-    if(library->length < 7) {
+    if(ZDGetLengthInternal(library) < 7) {
         return -1;
     }
 
 #if defined(_MSC_VER)
     __try {
 #endif
-        if(memcmp(library->mapping, "PLB", 3)) {
-            return -1;
-        }
+        if ((char)ZDReadByteInternal(library, 0) != 'P')
+            return -2;
+        if ((char)ZDReadByteInternal(library, 1) != 'L')
+            return -3;
+        if ((char)ZDReadByteInternal(library, 2) != 'B')
+            return -4;
 
-        library->tableType = library->mapping[3];
-        library->version   = library->mapping[4];
-        library->precision = library->mapping[5];
-        library->numFields = library->mapping[6];
+        library->tableType = ZDReadByteInternal(library, 3);
+        library->version   = ZDReadByteInternal(library, 4);
+        library->precision = ZDReadByteInternal(library, 5);
+        library->numFields = ZDReadByteInternal(library, 6);
 #if defined(_MSC_VER)
     } __except(GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
                ? EXCEPTION_EXECUTE_HANDLER
@@ -283,14 +317,14 @@ static int ZDParseHeader(ZoneDetect *library)
 #endif
 
     if(library->version >= 2) {
-        return -1;
+        return -5;
     }
 
     uint32_t index = UINT32_C(7);
 
     library->fieldNames = malloc(library->numFields * sizeof *library->fieldNames);
     if (!library->fieldNames) {
-        return -1;
+        return -6;
     }
 
     size_t i;
@@ -300,7 +334,7 @@ static int ZDParseHeader(ZoneDetect *library)
 
     library->notice = ZDParseString(library, &index);
     if(!library->notice) {
-        return -1;
+        return -7;
     }
 
     uint64_t tmp;
@@ -321,9 +355,11 @@ static int ZDParseHeader(ZoneDetect *library)
     library->dataOffset += index;
 
     /* Verify file length */
-    if(tmp + library->dataOffset != (uint32_t)library->length) {
-        return -2;
+    /*
+    if(tmp + library->dataOffset != (uint32_t)ZDGetLengthInternal(library)) {
+        return -8;
     }
+    */
 
     return 0;
 }
@@ -798,7 +834,10 @@ void ZDCloseDatabase(ZoneDetect *library)
             free(library->notice);
         }
 
-        if(library->closeType == 0) {
+        switch (library->closeType) 
+        {
+            case 0:
+            {
 #if defined(_MSC_VER) || defined(__MINGW32__)
             if(library->mapping && !UnmapViewOfFile(library->mapping)) zdError(ZD_E_DB_MUNMAP_MSVIEW, (int)GetLastError());
             if(library->fdMap && !CloseHandle(library->fdMap))         zdError(ZD_E_DB_MUNMAP, (int)GetLastError());
@@ -807,6 +846,14 @@ void ZDCloseDatabase(ZoneDetect *library)
             if(library->mapping && munmap(library->mapping, (size_t)(library->length))) zdError(ZD_E_DB_MUNMAP, 0);
             if(library->fd >= 0 && close(library->fd))                                  zdError(ZD_E_DB_CLOSE, 0);
 #endif
+            }
+            break;
+
+            case 1:
+            break;
+
+            case 2:
+            break;
         }
 
         free(library);
@@ -836,6 +883,42 @@ ZoneDetect *ZDOpenDatabaseFromMemory(void* buffer, size_t length)
         /* Parse the header */
         if(ZDParseHeader(library)) {
             zdError(ZD_E_PARSE_HEADER, 0);
+            goto fail;
+        }
+    }
+
+    return library;
+
+fail:
+    ZDCloseDatabase(library);
+    return NULL;
+}
+
+ZoneDetect *ZDOpenDatabaseFromFn(ZDFnReadByte fnRead, ZDFnLength fnLen)
+{
+    ZoneDetect *const library = malloc(sizeof *library);
+
+    if(library) {
+        memset(library, 0, sizeof(*library));
+        library->closeType = 2;
+        library->fnRead = fnRead;
+        library->fnLen = fnLen;
+
+        library->length = ZDGetLengthInternal(library);
+
+        if(library->length <= 0) {
+#if defined(_MSC_VER) || defined(__MINGW32__) || defined(__APPLE__) || defined(__linux__) || defined(__unix__) || defined(_POSIX_VERSION)
+            zdError(ZD_E_DB_SEEK, errno);
+#else
+            zdError(ZD_E_DB_SEEK, 0);
+#endif
+            goto fail;
+        }
+
+        /* Parse the header */
+        int result = ZDParseHeader(library);
+        if(result) {
+            zdError(ZD_E_PARSE_HEADER, result);
             goto fail;
         }
     }

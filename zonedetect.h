@@ -66,7 +66,11 @@ typedef struct ZoneDetectOpaque ZoneDetect;
 extern "C" {
 #endif
 
+typedef uint8_t (*ZDFnReadByte)(size_t offset);
+typedef size_t (*ZDFnLength)();
+
 ZD_EXPORT ZoneDetect *ZDOpenDatabase(const char *path);
+ZD_EXPORT ZoneDetect *ZDOpenDatabaseFromFn(ZDFnReadByte fnRead, ZDFnLength fnLen);
 ZD_EXPORT ZoneDetect *ZDOpenDatabaseFromMemory(void* buffer, size_t length);
 ZD_EXPORT void        ZDCloseDatabase(ZoneDetect *library);
 
